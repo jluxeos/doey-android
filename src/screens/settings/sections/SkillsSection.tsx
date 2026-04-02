@@ -1,0 +1,514 @@
+import React, { useCallback, useState } from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  Platform,
+  StyleSheet,
+  Switch,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { pick, types, errorCodes, isErrorWithCode } from '@react-native-documents/picker';
+import RNFS from 'react-native-fs';
+import type { CredentialManager } from '../../../permissions/credential-manager';
+import type { SkillInfo } from '../../../agent/skill-loader';
+import { SettingRow } from '../components/SettingRow';
+import { useNotificationAccess } from '../hooks/useNotificationAccess';
+import { t } from '../../../i18n';
+import type { TranslationKey } from '../../../i18n';
+import { AccessibilityHintsModal } from '../components/AccessibilityHintsModal';
+
+const CATEGORY_ORDER = ['communication', 'productivity', 'information', 'media', 'other'] as const;
+type SkillCategory = (typeof CATEGORY_ORDER)[number];
+
+const CATEGORY_TRANSLATION_KEY: Record<SkillCategory, TranslationKey> = {
+  communication: 'settings.skills.category.communication',
+  productivity: 'settings.skills.category.productivity',
+  information: 'settings.skills.category.information',
+  media: 'settings.skills.category.media',
+  other: 'settings.skills.category.other',
+};
+
+interface SkillsSectionProps {
+  allSkills: SkillInfo[];
+  enabledSkillNames: string[];
+  skillAvailability: Record<string, boolean>;
+  onToggleSkill: (skillName: string, enabled: boolean) => void;
+  credentialManager: CredentialManager;
+  skillCredentialStatus: Record<string, boolean>;
+  checkSkillCredentials: () => Promise<void>;
+  testingSkill: string | null;
+  testResults: Record<
+    string,
+    {
+      success: boolean;
+      message: string;
+      error?: string;
+      evidence?: {
+        toolCalls: Array<{ name: string; arguments: Record<string, unknown> }>;
+        toolResults: Array<{ toolName: string; result: string; isError: boolean }>;
+        finalResponse?: string;
+        iterations: number;
+      };
+    }
+  >;
+  handleTestSkill: (skill: SkillInfo) => Promise<void>;
+  showEvidencePopup: (result: {
+    success: boolean;
+    message: string;
+    error?: string;
+    evidence?: {
+      toolCalls: Array<{ name: string; arguments: Record<string, unknown> }>;
+      toolResults: Array<{ toolName: string; result: string; isError: boolean }>;
+      finalResponse?: string;
+      iterations: number;
+    };
+  }) => void;
+  onTestSkill?: (skillName: string) => Promise<{
+    success: boolean;
+    message: string;
+    error?: string;
+    evidence?: {
+      toolCalls: Array<{ name: string; arguments: Record<string, unknown> }>;
+      toolResults: Array<{ toolName: string; result: string; isError: boolean }>;
+      finalResponse?: string;
+      iterations: number;
+    };
+  }>;
+  /** Called when user picks and confirms a SKILL.md upload. */
+  onAddSkill?: (content: string) => Promise<{ success: boolean; error?: string }>;
+  /** Called when user confirms deletion of a dynamic (uploaded) skill. */
+  onDeleteSkill?: (skillName: string) => Promise<void>;
+  /** Names of dynamically uploaded skills (for delete button visibility). */
+  dynamicSkillNames?: string[];
+}
+
+export function SkillsSection({
+  allSkills,
+  enabledSkillNames,
+  skillAvailability,
+  onToggleSkill,
+  credentialManager,
+  skillCredentialStatus,
+  checkSkillCredentials,
+  testingSkill,
+  testResults,
+  handleTestSkill,
+  showEvidencePopup,
+  onTestSkill,
+  onAddSkill,
+  onDeleteSkill,
+  dynamicSkillNames = [],
+}: SkillsSectionProps): React.JSX.Element {
+  const [showOnlyInstalled, setShowOnlyInstalled] = useState(true);
+  const [uploading, setUploading] = useState(false);
+  const [showHintsModal, setShowHintsModal] = useState(false);
+  const { notificationAccessGranted, handleOpenNotificationSettings } =
+    useNotificationAccess(enabledSkillNames);
+
+  const handleConnectSkill = useCallback(
+    async (skill: SkillInfo) => {
+      if (!skill.credentials || skill.credentials.length === 0) return;
+
+      try {
+        for (const cred of skill.credentials) {
+          await credentialManager.startSetup(cred);
+        }
+        await checkSkillCredentials();
+      } catch (err) {
+        Alert.alert(
+          t('settings.skills.connectError.title'),
+          err instanceof Error ? err.message : String(err),
+        );
+      }
+    },
+    [credentialManager, checkSkillCredentials],
+  );
+
+  const handleDisconnectSkill = useCallback(
+    async (skill: SkillInfo) => {
+      Alert.alert(
+        t('settings.skills.disconnect.title').replace('{name}', skill.name),
+        t('settings.skills.disconnect.message'),
+        [
+          { text: t('settings.skills.disconnect.cancel'), style: 'cancel' },
+          {
+            text: t('settings.skills.disconnect.confirm'),
+            style: 'destructive',
+            onPress: async () => {
+              for (const cred of skill.credentials) {
+                // OAuth tokens are stored under auth_provider key, not credential ID
+                const key =
+                  cred.type === 'oauth' && cred.auth_provider ? cred.auth_provider : cred.id;
+                await credentialManager.revokeCredential(key);
+              }
+              await checkSkillCredentials();
+            },
+          },
+        ],
+      );
+    },
+    [credentialManager, checkSkillCredentials],
+  );
+
+  /** Open the system file picker, read the chosen .md file, and call onAddSkill */
+  const handlePickSkillFile = useCallback(async () => {
+    if (!onAddSkill) return;
+    try {
+      // pick() with mode:'import' copies the file into the app cache –
+      // the returned uri is a local file:// path; use RNFS to read it
+      const [result] = await pick({
+        type: [types.plainText, 'text/markdown'],
+        mode: 'import',
+      });
+
+      if (!result?.uri) {
+        Alert.alert(t('alert.error'), t('settings.skills.upload.readError'));
+        return;
+      }
+
+      setUploading(true);
+      let content: string;
+      try {
+        // Some providers return percent-encoded URIs; decode to a usable path when applicable
+        const rawUri = result.uri;
+        const decodedUri = decodeURI(rawUri);
+        // Some pickers also expose a direct filesystem path or a fileCopyUri; prefer those for RNFS
+        const anyResult = result as unknown as { path?: string; fileCopyUri?: string; name?: string };
+        const directPath = anyResult.path ?? (anyResult.fileCopyUri?.startsWith('file://') ? anyResult.fileCopyUri : undefined);
+
+        if (directPath) {
+          content = await RNFS.readFile(directPath.replace(/^file:\/\//, ''), 'utf8');
+        } else if (decodedUri.startsWith('file://') || decodedUri.startsWith('/')) {
+          content = await RNFS.readFile(decodedUri.replace(/^file:\/\//, ''), 'utf8');
+        } else if (decodedUri.startsWith('content://')) {
+          // Fallback for content:// URIs via ContentResolver
+          try {
+            const response = await fetch(decodedUri);
+            content = await response.text();
+          } catch (e) {
+            // As a last resort, try reading with RNFS in case the provider exposes it
+            content = await RNFS.readFile(decodedUri, 'utf8');
+          }
+        } else {
+          // Unknown scheme: try RNFS first, then fetch as a last attempt
+          try {
+            content = await RNFS.readFile(decodedUri, 'utf8');
+          } catch {
+            const response = await fetch(decodedUri);
+            content = await response.text();
+          }
+        }
+      } finally {
+        setUploading(false);
+      }
+
+      const outcome = await onAddSkill(content);
+      if (!outcome.success) {
+        Alert.alert(t('alert.error'), outcome.error ?? 'Unknown validation error.');
+      } else {
+        Alert.alert(
+          t('settings.skills.upload.successTitle'),
+          t('settings.skills.upload.successDesc'),
+        );
+      }
+    } catch (err) {
+      // User cancelled – silently ignore
+      if (isErrorWithCode(err) && err.code === errorCodes.OPERATION_CANCELED) {
+        setUploading(false);
+        return;
+      }
+      Alert.alert(t('alert.error'), err instanceof Error ? err.message : String(err));
+      setUploading(false);
+    }
+  }, [onAddSkill]);
+
+  /** Confirm and delete a dynamic skill */
+  const handleDeleteSkill = useCallback(
+    (skill: SkillInfo) => {
+      Alert.alert(
+        t('settings.skills.deleteDynamic.title').replace('{name}', skill.name),
+        t('settings.skills.deleteDynamic.message'),
+        [
+          { text: t('settings.skills.deleteDynamic.cancel'), style: 'cancel' },
+          {
+            text: t('settings.skills.deleteDynamic.confirm'),
+            style: 'destructive',
+            onPress: async () => {
+              await onDeleteSkill?.(skill.name);
+            },
+          },
+        ],
+      );
+    },
+    [onDeleteSkill],
+  );
+
+  /** Render a single skill row */
+  const renderSkillRow = (skill: (typeof allSkills)[number]) => {
+    const isEnabled = enabledSkillNames.includes(skill.name);
+    const isConfigured = skillCredentialStatus[skill.name] ?? true;
+    const hasCredentials = skill.credentials.length > 0;
+    const isInstalled = skillAvailability[skill.name] ?? true;
+    const testResult = testResults[skill.name];
+    // If skill is unavailable due to missing Client ID (has OAuth credentials but availability is false),
+    // treat it as 'config' issue, not 'app' issue
+    const hasOAuthCredentials = skill.credentials.some(c => c.type === 'oauth');
+    const notInstalledReason: 'app' | 'config' | null = isInstalled
+      ? null
+      : hasOAuthCredentials && skillAvailability[skill.name] === false
+        ? 'config'
+        : skill.android_package
+          ? 'app'
+          : 'config';
+
+    const isDynamic = dynamicSkillNames.includes(skill.name);
+
+    const hasOAuthOnly = skill.credentials.some(c => c.type === 'oauth');
+    const showConnectIcon = isEnabled && isInstalled && hasOAuthOnly && !isConfigured;
+    const showDisconnectIcon = isEnabled && isInstalled && hasOAuthOnly && isConfigured;
+    const showTestIcon = isEnabled && isInstalled && !!skill.testPrompt && isConfigured && !!onTestSkill;
+
+    return (
+      <View
+        key={skill.name}
+        style={[
+          { borderBottomWidth: StyleSheet.hairlineWidth },
+          !isInstalled && { opacity: 0.5 },
+        ]}>
+        {/* Row 1: Name + Badges + Icon actions + Switch */}
+        <View>
+          <View>
+            <Text>
+              {skill.name}
+            </Text>
+            {isDynamic && (
+              <View>
+                <Text>custom</Text>
+              </View>
+            )}
+            {!isInstalled ? (
+              <View>
+                <Text>
+                  {notInstalledReason === 'config'
+                    ? t('settings.skills.badge.notConfigured')
+                    : t('settings.skills.badge.notInstalled')}
+                </Text>
+              </View>
+            ) : isEnabled && hasCredentials ? (
+              <View
+                className={`px-2 py-0.5 rounded-full ${
+                  isConfigured ? 'bg-green-500/15' : 'bg-orange-500/15'
+                }`}>
+                <Text
+                  className={`text-[10px] font-semibold ${
+                    isConfigured ? 'text-green-400' : 'text-orange-400'
+                  }`}>
+                  {isConfigured
+                    ? t('settings.skills.badge.connected')
+                    : t('settings.skills.badge.setupNeeded')}
+                </Text>
+              </View>
+            ) : null}
+          </View>
+
+          {/* Icon action buttons + Switch */}
+          <View>
+            {/* Connect icon (shown when credentials missing) */}
+            {showConnectIcon && (
+              <TouchableOpacity
+                onPress={() => handleConnectSkill(skill)}
+                style={{ width: 28, height: 28 }}>
+                <Text>⊕</Text>
+              </TouchableOpacity>
+            )}
+            {/* Disconnect icon */}
+            {showDisconnectIcon && (
+              <TouchableOpacity
+                onPress={() => handleDisconnectSkill(skill)}
+                style={{ width: 28, height: 28 }}>
+                <Text>⊗</Text>
+              </TouchableOpacity>
+            )}
+            {/* Test icon / spinner */}
+            {showTestIcon && (
+              <TouchableOpacity
+                onPress={() => handleTestSkill(skill)}
+                disabled={testingSkill === skill.name}
+                style={{ width: 28, height: 28 }}>
+                {testingSkill === skill.name ? (
+                  <ActivityIndicator size="small" color="#FFFFFF" />
+                ) : (
+                  <Text>▷</Text>
+                )}
+              </TouchableOpacity>
+            )}
+            {/* Test result dot */}
+            {testResult && (
+              <TouchableOpacity
+                onPress={() => testResult.evidence && showEvidencePopup(testResult)}
+                disabled={!testResult.evidence}
+                style={{ width: 20, height: 20 }}>
+                <Text
+                  className={`text-[13px] leading-none font-bold ${
+                    testResult.success ? 'text-green-400' : 'text-red-400'
+                  }`}>
+                  {testResult.success ? '✓' : '✗'}
+                </Text>
+              </TouchableOpacity>
+            )}
+            {/* Delete icon (dynamic skills only) */}
+            {isDynamic && onDeleteSkill && (
+              <TouchableOpacity
+                onPress={() => handleDeleteSkill(skill)}
+                style={{ width: 28, height: 28 }}>
+                <Text>✕</Text>
+              </TouchableOpacity>
+            )}
+            <Switch
+              value={isEnabled}
+              onValueChange={v => onToggleSkill(skill.name, v)}
+              disabled={!isInstalled}
+              trackColor={{ false: '#3A3A3C', true: '#007AFF' }}
+              thumbColor="#FFFFFF"
+            />
+          </View>
+        </View>
+
+        {/* Row 2: Description */}
+        <Text>{skill.description}</Text>
+
+        {/* Row 3: Not-available hint */}
+        {notInstalledReason === 'app' && (
+          <Text>
+            {t('settings.skills.requires').replace('{package}', skill.android_package ?? '')}
+          </Text>
+        )}
+        {notInstalledReason === 'config' && (
+          <Text>
+            {t('settings.skills.clientIdMissing')}
+          </Text>
+        )}
+
+        {/* Row 3.5: Notification access status (for notifications skill) */}
+        {skill.name === 'notifications' && isEnabled && Platform.OS === 'android' && (
+          <View>
+            {notificationAccessGranted === null ? (
+              <Text>
+                {t('settings.skills.notification.checking')}
+              </Text>
+            ) : notificationAccessGranted ? (
+              <View>
+                <Text>✓</Text>
+                <Text>
+                  {t('settings.skills.notification.granted')}
+                </Text>
+              </View>
+            ) : (
+              <View>
+                <Text>⚠</Text>
+                <Text>
+                  {t('settings.skills.notification.denied')}
+                </Text>
+                <TouchableOpacity
+                  onPress={handleOpenNotificationSettings}>
+                  <Text>
+                    {t('settings.skills.notification.allowButton')}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            )}
+          </View>
+        )}
+      </View>
+    );
+  };
+
+  // Group skills by category, respecting the active filter
+  const filteredSkills = allSkills.filter(skill => {
+    if (showOnlyInstalled) {
+      return skillAvailability[skill.name] ?? true;
+    }
+    return true;
+  });
+
+  const skillsByCategory = CATEGORY_ORDER.reduce<Record<string, typeof allSkills>>(
+    (acc, cat) => {
+      acc[cat] = filteredSkills.filter(s => (s.category ?? 'other') === cat);
+      return acc;
+    },
+    {},
+  );
+
+  return (
+    <>
+      {/* Upload new skill button */}
+      {onAddSkill && (
+        <View style={{ borderBottomWidth: StyleSheet.hairlineWidth }}>
+          <TouchableOpacity
+            onPress={handlePickSkillFile}
+            disabled={uploading}>
+            {uploading ? (
+              <ActivityIndicator size="small" color="#FFFFFF" />
+            ) : (
+              <Text>+ {t('settings.skills.upload.button')}</Text>
+            )}
+          </TouchableOpacity>
+          <Text>
+            {t('settings.skills.upload.hint')}
+          </Text>
+        </View>
+      )}
+
+      {/* Filter toggle */}
+      <SettingRow
+        label={t('settings.skills.filterLabel')}
+        description={t('settings.skills.filterDesc')}>
+        <Switch
+          value={showOnlyInstalled}
+          onValueChange={setShowOnlyInstalled}
+          trackColor={{ false: '#3A3A3C', true: '#007AFF' }}
+          thumbColor="#FFFFFF"
+        />
+      </SettingRow>
+
+      {/* Skills grouped by category */}
+      {CATEGORY_ORDER.map(cat => {
+        const skills = skillsByCategory[cat];
+        if (!skills || skills.length === 0) return null;
+        return (
+          <View key={cat}>
+            {/* Category header */}
+            <View
+              style={{ borderBottomWidth: StyleSheet.hairlineWidth }}
+              accessible={false}>
+              <Text>
+                {t(CATEGORY_TRANSLATION_KEY[cat])}
+              </Text>
+            </View>
+            {/* Skill rows */}
+            {skills.map(skill => renderSkillRow(skill))}
+          </View>
+        );
+      })}
+
+      {/* Accessibility Hints management */}
+      <SettingRow
+        label={t('accessibilityHints.button')}
+        description={t('accessibilityHints.buttonDesc')}>
+        <TouchableOpacity
+          onPress={() => setShowHintsModal(true)}>
+          <Text>
+            {t('accessibilityHints.title')} →
+          </Text>
+        </TouchableOpacity>
+      </SettingRow>
+
+      <AccessibilityHintsModal
+        visible={showHintsModal}
+        onClose={() => setShowHintsModal(false)}
+      />
+    </>
+  );
+}

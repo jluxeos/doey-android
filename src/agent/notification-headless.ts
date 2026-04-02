@@ -1,0 +1,342 @@
+/**
+ * Notification Headless Task – Background sub-agent execution for notifications
+ *
+ * Registered via AppRegistry.registerHeadlessTask in index.js.
+ * Started directly by DoeyNotificationListenerService (native Android) when a
+ * notification from a subscribed app arrives – bypasses the React Native foreground
+ * thread entirely.
+ *
+ * This module:
+ *   1. Parses the incoming notification data
+ *   2. Loads agent config (API key, provider, enabled skills) from native storage
+ *   3. Loads notification rules from AsyncStorage
+ *   4. Checks if any rules apply to this notification's app
+ *   5. Runs the full notification sub-agent (evaluates conditions, executes matching rule)
+ *   6. Writes the final result to ConversationStore pending queue
+ *   7. Brings DoeyBot back to the foreground – the app then speaks the result via drainPending
+ */
+import { SkillLoader, registerSkillContent } from './skill-loader';
+import { runNotificationSubAgent } from './notification-sub-agent';
+import type { NotificationPayload } from './notification-sub-agent';
+import { createLLMProvider } from '../llm/llm-registry';
+import type { LLMProvider } from '../llm/types';
+import { DebugLogger } from './debug-logger';
+import { DebugFileLogger } from './debug-file-logger';
+import { ConversationStore } from './conversation-store';
+import { SoulStore } from './soul-store';
+import { PersonalMemoryStore } from './personal-memory-store';
+import { addEntry } from './journal-store';
+import { loadRules, getRulesForApp } from './notification-rules-store';
+import type { NotificationRule } from './notification-rules-store';
+import { bringToForeground } from './bring-to-foreground';
+import { formulateError } from './system-prompt';
+import { SILENT_REPLY_TOKEN, NO_MATCH_TOKEN } from './tokens';
+
+// Credential infrastructure
+import { TokenStore } from '../permissions/token-store';
+import { CredentialManager } from '../permissions/credential-manager';
+
+
+// Agent config – reuse SchedulerModule (same config as all headless tasks)
+import SchedulerModule from '../native/SchedulerModule';
+
+// Skills – imported at bundle time (metro md-transformer)
+import googleMapsSkill from '../../assets/skills/google-maps/SKILL.md';
+import phoneSkill from '../../assets/skills/phone/SKILL.md';
+import smsSkill from '../../assets/skills/sms/SKILL.md';
+import gmailSkill from '../../assets/skills/gmail/SKILL.md';
+import spotifySkill from '../../assets/skills/spotify/SKILL.md';
+import contactsSkill from '../../assets/skills/contacts/SKILL.md';
+import calendarSkill from '../../assets/skills/calendar/SKILL.md';
+import googleTasksSkill from '../../assets/skills/google-tasks/SKILL.md';
+import schedulerSkill from '../../assets/skills/scheduler/SKILL.md';
+import whatsappSkill from '../../assets/skills/whatsapp/SKILL.md';
+import listsSkill from '../../assets/skills/lists/SKILL.md';
+import notificationsSkill from '../../assets/skills/notifications/SKILL.md';
+import weatherSkill from '../../assets/skills/weather/SKILL.md';
+import slackSkill from '../../assets/skills/slack/SKILL.md';
+
+// Register all skill content so SkillLoader can build the system prompt in headless context
+registerSkillContent('google-maps', googleMapsSkill);
+registerSkillContent('phone', phoneSkill);
+registerSkillContent('sms', smsSkill);
+registerSkillContent('gmail', gmailSkill);
+registerSkillContent('spotify', spotifySkill);
+registerSkillContent('contacts', contactsSkill);
+registerSkillContent('calendar', calendarSkill);
+registerSkillContent('google-tasks', googleTasksSkill);
+registerSkillContent('scheduler', schedulerSkill);
+registerSkillContent('whatsapp', whatsappSkill);
+registerSkillContent('lists', listsSkill);
+registerSkillContent('notifications', notificationsSkill);
+registerSkillContent('weather', weatherSkill);
+registerSkillContent('slack', slackSkill);
+
+// ── Config & constants ────────────────────────────────────────────────────────
+
+const TAG = 'NotifHeadless';
+
+interface AgentConfig {
+  apiKey: string;
+  provider: 'claude' | 'openai';
+  model?: string;
+  enabledSkillNames: string[];
+  googleWebClientId?: string;
+  drivingMode?: boolean;
+  /** BCP-47 language tag, e.g. 'de-AT', 'en-US'. Falls back to 'en-US'. */
+  language?: string;
+  /** Max iterations for notification sub-agents (default: 8) */
+  maxSubAgentIterations?: number;
+}
+
+/** Maps Android package names to human-readable app names. */
+const APP_ALIAS_MAP: Record<string, string> = {
+  'com.whatsapp': 'WhatsApp',
+  'com.google.android.gm': 'Email',
+  'org.telegram.messenger': 'Telegram',
+  'org.thoughtcrime.securesms': 'Signal',
+  'com.android.mms': 'SMS',
+};
+
+// ── Main headless task ────────────────────────────────────────────────────────
+
+export default async function notificationHeadlessTask(
+  taskData: { notificationJson: string },
+): Promise<void> {
+  DebugFileLogger.writeSystemLog('LIFECYCLE', '▶ DoeyNotificationTask started');
+  DebugLogger.add('info', TAG, '▶ Notification headless task started');
+
+  // 1. Parse notification data
+  let notifData: {
+    packageName: string;
+    title: string;
+    text: string;
+    sender: string;
+    timestamp: number;
+    key: string;
+  };
+
+  try {
+    notifData = JSON.parse(taskData.notificationJson);
+  } catch (err) {
+    DebugLogger.add('error', TAG, `Failed to parse notification JSON: ${err}`);
+    return;
+  }
+
+  const { packageName, title, text, sender } = notifData;
+
+  // Detailed logging – mirrors what App.tsx previously logged on the foreground thread
+  DebugLogger.add(
+    'info',
+    TAG,
+    `${packageName}: "${title}"`,
+    [
+      `packageName: ${packageName}`,
+      `title: ${title}`,
+      `text: ${text}`,
+      `sender: ${sender}`,
+      `timestamp: ${notifData.timestamp}`,
+      `key: ${notifData.key}`,
+    ].join('\n'),
+  );
+
+  // 2. Load agent config
+  const configJson = await SchedulerModule.getAgentConfig();
+  if (!configJson) {
+    DebugLogger.add('error', TAG, 'No agent config found – cannot run sub-agent');
+    return;
+  }
+
+  const config: AgentConfig = JSON.parse(configJson);
+
+  // Check if notifications skill is enabled
+  if (!config.enabledSkillNames.includes('notifications')) {
+    DebugLogger.add('info', TAG, 'Notifications skill is disabled – skipping processing');
+    return;
+  }
+
+  const lang = config.language || 'en-US';
+  const drivingMode = config.drivingMode ?? false;
+
+  if (!config.apiKey) {
+    DebugLogger.add('error', TAG, 'No API key in agent config');
+    return;
+  }
+
+  // 3. Build LLM provider
+  const provider: LLMProvider = createLLMProvider({
+    provider: config.provider,
+    apiKey: config.apiKey,
+    model: config.model || '',
+  });
+
+  const model = provider.getCurrentModel();
+  DebugLogger.add('info', TAG, `Provider: ${config.provider} (${model})`);
+
+  // 4. Load rules from AsyncStorage and filter for this app
+  let rules: NotificationRule[] = [];
+  try {
+    const allRules = await loadRules();
+    rules = getRulesForApp(allRules, packageName);
+  } catch (err) {
+    DebugLogger.add('error', TAG, `Failed to load rules: ${err}`);
+    return;
+  }
+
+  if (rules.length === 0) {
+    DebugLogger.add('info', TAG, `No enabled rules for ${packageName} – skipping`);
+    return;
+  }
+
+  DebugLogger.add(
+    'info',
+    TAG,
+    `${rules.length} rule(s) for ${packageName}`,
+    rules.map(r => `[${r.id}] ${r.condition || '(catch-all)'} → ${r.instruction}`).join('\n'),
+  );
+
+  // 5. Map package name to display name and build payload
+  const appName = APP_ALIAS_MAP[packageName] || packageName;
+  const isEmail = appName === 'Email' || appName === 'Gmail';
+
+  const payload: NotificationPayload = {
+    appName,
+    sender: sender || title || '',
+    subject: isEmail ? (text || '') : '',
+    preview: isEmail ? '' : (text || ''),
+    packageName,
+  };
+
+  // 6. Set up credential manager (headless unlock – no biometric prompt)
+  const tokenStore = new TokenStore();
+  tokenStore.unlockForHeadless();
+  const credentialManager = new CredentialManager(tokenStore);
+
+  if (config.googleWebClientId) {
+    credentialManager.configureGoogleTokenRefresh(config.googleWebClientId);
+  }
+
+  // 7. Run notification sub-agent
+  try {
+    const soul = await SoulStore.getSoul();
+    const personalMemory = await PersonalMemoryStore.getMemory();
+    DebugLogger.add('info', TAG, `Running sub-agent for: "${appName} – ${payload.sender}"`);
+
+    const result = await runNotificationSubAgent(
+      {
+        provider,
+        credentialManager,
+        enabledSkillNames: config.enabledSkillNames,
+        drivingMode,
+        language: lang,
+        soul,
+        personalMemory,
+        maxIterations: config.maxSubAgentIterations,
+      },
+      payload,
+      rules,
+    );
+
+    const resultText = result.content;
+    const isMaxIterationsReached = result.iterations >= (config.maxSubAgentIterations ?? 8);
+
+    // Silent tokens: skip UI output entirely
+    const isSilent = resultText?.includes(SILENT_REPLY_TOKEN) || resultText?.includes(NO_MATCH_TOKEN);
+
+    if (resultText && !isSilent) {
+      // 8. Check if max iterations reached and format message accordingly
+      let messageToShow = resultText;
+      if (isMaxIterationsReached || !messageToShow) {
+        const rawError = isMaxIterationsReached
+          ? `Notification processing reached iteration limit (${result.iterations} iterations) and could not be completed. You can increase the iteration limit in Settings → Agent Iterations → Sub-Agent (App Rules & Scheduler).`
+          : `Notification processing for "${packageName}" completed, but no output was generated.`;
+        messageToShow = await formulateError({
+          provider,
+          instruction: `Process notification from ${packageName}`,
+          rawError,
+          drivingMode,
+          language: lang,
+        });
+      }
+
+      // 9. Write result to pending queue first, then restore foreground.
+      //    (appendPending must complete before bringToForeground so drainPending
+      //    finds the message when AppState fires 'active')
+      await ConversationStore.appendPending('assistant', messageToShow).catch(() => {});
+      DebugLogger.add('info', TAG, `✅ Sub-agent done, result written to pending queue`);
+
+      // 10. Create journal entry (always, even on errors/max iterations)
+      try {
+        await addEntry({
+          category: 'Notifications',
+          title: `${appName} – ${payload.sender}`,
+          details: messageToShow,
+        });
+      } catch (err) {
+        // Non-fatal: journal entry creation failed
+        DebugLogger.add('error', TAG, `Failed to create journal entry: ${err}`);
+      }
+
+      // 11. Bring app to foreground – drainPending() will display + speak the result
+      await bringToForeground(TAG);
+      DebugFileLogger.writeSystemLog('LIFECYCLE', `✅ DoeyNotificationTask finished (${packageName})`);
+    } else if (isSilent) {
+      // Silent reply – no condition matched or sub-agent decided output is not user-facing
+      const reason = resultText?.includes(NO_MATCH_TOKEN) ? 'no condition matched' : 'silent reply';
+      DebugLogger.add('info', TAG, `${reason} for "${packageName}" – no bubble shown`);
+      DebugFileLogger.writeSystemLog('LIFECYCLE', `✅ DoeyNotificationTask finished – ${reason} (${packageName})`);
+    } else {
+      // resultText is empty (shouldn't happen with tool-loop fix, but safety fallback)
+      DebugLogger.add('info', TAG, `Sub-agent returned empty result for "${packageName}"`);
+      const rawError = `Notification processing for "${packageName}" completed, but no output was generated.`;
+      const formattedError = await formulateError({
+        provider,
+        instruction: `Process notification from ${packageName}`,
+        rawError,
+        drivingMode,
+        language: lang,
+      });
+      await ConversationStore.appendPending('assistant', formattedError).catch(() => {});
+      
+      // Create journal entry for error case
+      try {
+        await addEntry({
+          category: 'Notifications',
+          title: `${appName} – ${payload.sender}`,
+          details: formattedError,
+        });
+      } catch (err) {
+        // Non-fatal: journal entry creation failed
+        DebugLogger.add('error', TAG, `Failed to create journal entry: ${err}`);
+      }
+      
+      await bringToForeground(TAG);
+    }
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    DebugFileLogger.writeSystemLog('LIFECYCLE', `❌ DoeyNotificationTask crashed (${packageName}): ${errMsg}`);
+    DebugLogger.add('error', TAG, `Sub-agent failed: ${errMsg}`);
+    const formattedError = await formulateError({
+      provider,
+      instruction: `Process notification from ${packageName}`,
+      rawError: errMsg,
+      drivingMode,
+      language: lang,
+    });
+    await ConversationStore.appendPending('assistant', formattedError).catch(() => {});
+    
+    // Create journal entry for error case
+    try {
+      await addEntry({
+        category: 'Notifications',
+        title: `${appName} – ${payload.sender}`,
+        details: formattedError,
+      });
+    } catch (journalErr) {
+      // Non-fatal: journal entry creation failed
+      DebugLogger.add('error', TAG, `Failed to create journal entry: ${journalErr}`);
+    }
+    
+    await bringToForeground(TAG);
+  }
+}

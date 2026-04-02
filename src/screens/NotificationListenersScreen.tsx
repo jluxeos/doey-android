@@ -1,0 +1,214 @@
+/**
+ * NotificationListenersScreen – View and manage all notification listener rules
+ *
+ * Loads all rules from the NotificationRulesStore and displays them as
+ * collapsible entries with details and a delete button.
+ */
+import React, { useCallback, useEffect, useState } from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  ScrollView,
+  Switch,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { t } from '../i18n';
+import { MarkdownText } from '../components/MarkdownText';
+import { EditableDetailRow } from '../components/EditableDetailRow';
+import { deleteRule, loadRules, updateRule, type NotificationRule } from '../agent/notification-rules-store';
+
+interface NotificationListenersScreenProps {
+  onBack: () => void;
+  enabledSkillNames: string[];
+  isDark: boolean;
+}
+
+function formatDate(isoString: string): string {
+  const d = new Date(isoString);
+  return d.toLocaleString('de-AT', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+export function NotificationListenersScreen({
+  onBack,
+  enabledSkillNames,
+  isDark,
+}: NotificationListenersScreenProps): React.JSX.Element {
+  const insets = useSafeAreaInsets();
+  const [rules, setRules] = useState<NotificationRule[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  
+  const isSkillEnabled = enabledSkillNames.includes('notifications');
+
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    try {
+      const loaded = await loadRules();
+      loaded.sort((a, b) => {
+        if (a.enabled !== b.enabled) return a.enabled ? -1 : 1;
+        return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      });
+      setRules(loaded);
+    } catch {
+      setRules([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isSkillEnabled) {
+      loadData();
+    }
+  }, [loadData, isSkillEnabled]);
+
+  const handleToggle = (id: string) => {
+    setExpandedId(prev => (prev === id ? null : id));
+  };
+
+  const handleToggleEnabled = async (rule: NotificationRule) => {
+    await updateRule(rule.id, { enabled: !rule.enabled });
+    await loadData();
+  };
+
+  const handleSaveField = async (
+    rule: NotificationRule,
+    field: 'instruction' | 'condition',
+    value: string,
+  ) => {
+    await updateRule(rule.id, { [field]: value });
+    await loadData();
+  };
+
+  const handleDelete = (rule: NotificationRule) => {
+    Alert.alert(
+      t('notifListeners.delete.title'),
+      t('notifListeners.delete.message'),
+      [
+        { text: t('notifListeners.delete.cancel'), style: 'cancel' },
+        {
+          text: t('notifListeners.delete.confirm'),
+          style: 'destructive',
+          onPress: async () => {
+            await deleteRule(rule.id);
+            if (expandedId === rule.id) setExpandedId(null);
+            await loadData();
+          },
+        },
+      ],
+    );
+  };
+
+  return (
+    <View style={{ paddingTop: insets.top, paddingBottom: insets.bottom }}>
+      {/* Header */}
+      <View>
+        <TouchableOpacity onPress={onBack}>
+          <Text>{t('settings.back')}</Text>
+        </TouchableOpacity>
+        <Text>{t('notifListeners.title')}</Text>
+      </View>
+
+      {!isSkillEnabled ? (
+        <View>
+          <MarkdownText isDark={isDark}>{t('notifListeners.skillDisabled')}</MarkdownText>
+        </View>
+      ) : loading ? (
+        <View>
+          <ActivityIndicator size="large" color="#007AFF" />
+        </View>
+      ) : rules.length === 0 ? (
+        <View>
+          <Text>
+            {t('notifListeners.empty')}
+          </Text>
+        </View>
+      ) : (
+        <ScrollView
+          contentContainerStyle={{ padding: 16, gap: 12, paddingBottom: 48 }}>
+          {rules.map(rule => {
+            const isExpanded = expandedId === rule.id;
+            return (
+              <View key={rule.id}>
+                {/* Rule header row */}
+                <View>
+                  <TouchableOpacity
+                    onPress={() => handleToggle(rule.id)}
+                    activeOpacity={0.7}>
+                    <Text>
+                      {isExpanded ? '▾' : '▸'}
+                    </Text>
+                    <View>
+                      <Text>
+                        {rule.appLabel}
+                      </Text>
+                      <Text
+                        numberOfLines={1}>
+                        {rule.instruction}
+                      </Text>
+                    </View>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    onPress={() => handleDelete(rule)}
+                    activeOpacity={0.7}
+                    style={{ width: 28, height: 28 }}>
+                    <Text>🗑️</Text>
+                  </TouchableOpacity>
+                  <Switch
+                    value={rule.enabled}
+                    onValueChange={() => handleToggleEnabled(rule)}
+                    trackColor={{ false: '#3A3A3C', true: '#007AFF' }}
+                    thumbColor="#FFFFFF"
+                  />
+                </View>
+
+                {/* Expanded content */}
+                {isExpanded && (
+                  <View>
+                    <DetailRow label={t('notifListeners.detail.app')} value={`${rule.appLabel} (${rule.app})`} />
+                    <EditableDetailRow
+                      label={t('notifListeners.detail.instruction')}
+                      value={rule.instruction}
+                      onSave={v => handleSaveField(rule, 'instruction', v)}
+                      labelWidth={96}
+                    />
+                    <EditableDetailRow
+                      label={t('notifListeners.detail.condition')}
+                      value={rule.condition}
+                      onSave={v => handleSaveField(rule, 'condition', v)}
+                      labelWidth={96}
+                      placeholder={t('notifListeners.detail.conditionAlways')}
+                    />
+                    <DetailRow
+                      label={t('notifListeners.detail.status')}
+                      value={rule.enabled ? t('notifListeners.status.active') : t('notifListeners.status.disabled')}
+                    />
+                    <DetailRow label={t('notifListeners.detail.createdAt')} value={formatDate(rule.created_at)} />
+                  </View>
+                )}
+              </View>
+            );
+          })}
+        </ScrollView>
+      )}
+    </View>
+  );
+}
+
+function DetailRow({ label, value }: { label: string; value: string }): React.JSX.Element {
+  return (
+    <View>
+      <Text>{label}</Text>
+      <Text>{value}</Text>
+    </View>
+  );
+}

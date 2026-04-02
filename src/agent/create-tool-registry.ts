@@ -1,0 +1,143 @@
+/**
+ * createToolRegistry – Central factory for the standard tool set.
+ *
+ * Every place that needs the "normal" agent tools (main pipeline, skill tests,
+ * headless scheduler) should call this instead of hand-registering each tool.
+ * This avoids duplicating the same registration block in multiple files.
+ */
+import { ToolRegistry } from './tool-registry';
+import { CredentialManager } from '../permissions/credential-manager';
+import type { SkillLoader } from './skill-loader';
+import type { LLMProvider } from '../llm/types';
+
+// Tools
+import { IntentTool } from '../tools/intent-tool';
+import { TTSTool } from '../tools/tts-tool';
+import { HttpTool } from '../tools/http-tool';
+import { QueryContactsTool } from '../tools/query-contacts-tool';
+import { QuerySmsTool } from '../tools/query-sms-tool';
+import { QueryCallLogTool } from '../tools/query-call-log-tool';
+import { DeviceTool } from '../tools/device-tool';
+import { SmsTool } from '../tools/sms-tool';
+import { SchedulerTool } from '../tools/scheduler-tool';
+import { NotificationListenerTool } from '../tools/notification-listener-tool';
+import { AccessibilityTool } from '../tools/accessibility-tool';
+import { FileStorageTool } from '../tools/file-storage-tool';
+import { BeepTool } from '../tools/beep-tool';
+import { AppSearchTool } from '../tools/app-search-tool';
+import { SkillDetailTool } from '../tools/skill-detail-tool';
+import { CheckCredentialTool } from '../tools/check-credential-tool';
+import { PersonalMemoryTool } from '../tools/personal-memory-tool';
+import { AccessibilityHintTool } from '../tools/accessibility-hint-tool';
+import AccessibilityModule from '../native/AccessibilityModule';
+import { GmailSendTool } from '../tools/gmail-send-tool';
+import { JournalTool } from '../tools/journal-tool';
+import { TimerTool } from '../tools/timer-tool';
+import { DateTimeTool } from '../tools/datetime-tool';
+import { PlayAudioTool } from '../tools/play-audio-tool';
+import { MediaQueueTool } from '../tools/media-queue-tool';
+
+export interface CreateToolRegistryOptions {
+  credentialManager: CredentialManager;
+  skillLoader: SkillLoader;
+
+  /**
+   * Include the TTS tool.
+   * - `true` for headless / skill-test contexts (sub-agent speaks via tool).
+   * - `false` (default) for the interactive pipeline (TTS handled by the pipeline itself).
+   */
+  includeTts?: boolean;
+
+  /**
+   * Include the Scheduler tool.
+   * - `false` for the headless sub-agent (prevents recursive schedule creation).
+   * - `true` (default) everywhere else.
+   */
+  includeScheduler?: boolean;
+
+  /**
+   * Include the Accessibility tool.
+   * - `false` for headless sub-agents (scheduler, notifications).
+   * - `true` (default) for the main agent and skill tests.
+   */
+  includeAccessibility?: boolean;
+
+  /**
+   * Include personal-memory write tool.
+   * Enable in main loop, disable in sub-agent loops.
+   */
+  includePersonalMemoryTool?: boolean;
+
+  /**
+   * LLM provider for memory condensing after each upsert.
+   * Only used when includePersonalMemoryTool is true.
+   */
+  provider?: LLMProvider;
+}
+
+/**
+ * Create a ToolRegistry pre-loaded with the standard tool set.
+ *
+ * After calling this you can still call `registry.removeDisabledSkillTools()`
+ * to strip tools whose exclusive skill is disabled.
+ */
+export async function createToolRegistry(opts: CreateToolRegistryOptions): Promise<ToolRegistry> {
+  const registry = new ToolRegistry();
+
+  registry.register(new IntentTool());
+  if (opts.includeTts) {
+    registry.register(new TTSTool());
+  }
+  registry.register(new HttpTool(opts.credentialManager));
+  registry.register(new QueryContactsTool());
+  registry.register(new QuerySmsTool());
+  registry.register(new QueryCallLogTool());
+  registry.register(new DeviceTool());
+  registry.register(new DateTimeTool());
+  registry.register(new SmsTool());
+  if (opts.includeScheduler !== false) {
+    registry.register(new SchedulerTool());
+  }
+  registry.register(new NotificationListenerTool());
+  
+  // Check if Accessibility Service is enabled (only once, reuse result)
+  let accessibilityServiceEnabled = false;
+  if (opts.includeAccessibility !== false) {
+    try {
+      accessibilityServiceEnabled = await AccessibilityModule.isAccessibilityServiceEnabled();
+    } catch {
+      // If check fails, assume service is not enabled
+      accessibilityServiceEnabled = false;
+    }
+    if (accessibilityServiceEnabled) {
+      registry.register(new AccessibilityTool());
+    }
+  }
+  
+  registry.register(new AppSearchTool(opts.provider));
+  registry.register(new FileStorageTool());
+  registry.register(new PlayAudioTool());
+  registry.register(new MediaQueueTool());
+  registry.register(new BeepTool());
+  registry.register(new TimerTool());
+  registry.register(new SkillDetailTool(opts.skillLoader));
+  registry.register(new CheckCredentialTool(opts.credentialManager));
+  registry.register(new JournalTool());
+  if (opts.includePersonalMemoryTool !== false) {
+    registry.register(new PersonalMemoryTool(opts.provider));
+  }
+  if (opts.provider && opts.includeAccessibility !== false && accessibilityServiceEnabled) {
+    registry.register(new AccessibilityHintTool(opts.provider));
+  }
+
+  // Conditionally register GmailSendTool if Gmail skill is enabled and configured
+  const gmailSkill = opts.skillLoader.getSkill('gmail');
+  if (gmailSkill) {
+    const credentialsConfigured = await opts.credentialManager.areAllConfigured(gmailSkill.credentials);
+    if (credentialsConfigured) {
+      registry.register(new GmailSendTool(opts.credentialManager));
+    }
+  }
+
+  return registry;
+}
